@@ -1,0 +1,1 @@
+powershell  -WorkingDirectory ~ -file yt-dlp-gui.ps1

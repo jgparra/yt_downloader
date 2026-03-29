@@ -1,0 +1,80 @@
+# yt-dlp GUI Manager - .gitignore
+
+# ===== Downloads =====
+V_A_downloads/
+*.mp4
+*.mp3
+*.webm
+*.mkv
+*.m4a
+*.opus
+
+# ===== yt-dlp and FFmpeg =====
+mi_yt_dlp/
+ffmpeg/
+ffmpeg-*.zip
+ffmpeg-*.tar.*
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+env/
+ENV/
+.venv
+
+# ===== PowerShell =====
+*.ps1.backup
+
+# ===== IDEs and Editors =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Logs =====
+*.log
+logs/
+*.tmp
+
+# ===== OS Files =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ===== Backup Files =====
+*.bak
+*.backup
+*.old
+
+# ===== Temporary Files =====
+temp/
+tmp/
+*.temp
