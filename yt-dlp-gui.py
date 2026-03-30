@@ -248,30 +248,36 @@ class YtDlpGUI:
         )
         self.btn_ffmpeg.place(x=120, y=75, width=100, height=35)
         
+        # Download options
+        self.make_label("Type:", 315, 82, bold=True)
+        self.download_type_var = tk.StringVar(value="audio")
+        self.download_type_combo = ttk.Combobox(
+            self.root,
+            textvariable=self.download_type_var,
+            values=["video", "audio"],
+            state="readonly",
+            style="Modern.TCombobox"
+        )
+        self.download_type_combo.place(x=355, y=80, width=105, height=28)
+
         # Buttons - Row 2 (Action buttons)
-        self.btn_download_video = tk.Button(
-            self.root, text="Download Video", bg="#ADD8E6",
-            font=("Arial", 10, "bold"), command=self.download_video_thread
+        self.btn_start = tk.Button(
+            self.root, text="Start", bg="#ADD8E6",
+            font=("Arial", 10, "bold"), command=self.start_download_thread
         )
-        self.btn_download_video.place(x=10, y=120, width=135, height=35)
-        
-        self.btn_download_audio = tk.Button(
-            self.root, text="Download Audio", bg="#F08080",
-            font=("Arial", 10, "bold"), command=self.download_audio_thread
-        )
-        self.btn_download_audio.place(x=155, y=120, width=135, height=35)
-        
+        self.btn_start.place(x=10, y=120, width=160, height=35)
+
         self.btn_clear_log = tk.Button(
             self.root, text="Clear Log", bg="#FFFFE0",
             font=("Arial", 10, "bold"), command=self.clear_log
         )
-        self.btn_clear_log.place(x=300, y=120, width=135, height=35)
-        
+        self.btn_clear_log.place(x=180, y=120, width=160, height=35)
+
         self.btn_exit = tk.Button(
             self.root, text="Exit", bg="#D3D3D3",
             font=("Arial", 10, "bold"), command=self.root.quit
         )
-        self.btn_exit.place(x=445, y=120, width=225, height=35)
+        self.btn_exit.place(x=350, y=120, width=320, height=35)
         
         # Log section
         log_label = tk.Label(self.root, text="Log:", font=("Arial", 10))
@@ -652,6 +658,15 @@ After installation, restart this application to use FFmpeg.
     
     # ===== DOWNLOAD FUNCTIONS =====
     
+
+    def start_download_thread(self):
+        """Start download based on selected type."""
+        mode = self.download_type_var.get().strip().lower()
+        if mode == "video":
+            self.download_video_thread()
+        else:
+            self.download_audio_thread()
+
     def download_video_thread(self):
         """Thread wrapper for download_video"""
         thread = threading.Thread(target=self.download_video, daemon=True)
