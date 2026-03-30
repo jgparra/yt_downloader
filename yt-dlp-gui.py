@@ -61,19 +61,86 @@ WINDOW_WIDTH = 700
 WINDOW_HEIGHT = 550
 
 # Colors
-BG_COLOR = "#f0f0f0"
-LOG_BG_COLOR = "#000000"
-LOG_FG_COLOR = "#00ff00"
+APP_BG_COLOR = "#d4d0c8"
+CARD_BG_COLOR = "#efefef"
+TEXT_COLOR = "#1a1a1a"
+MUTED_TEXT_COLOR = "#4a4a4a"
+ACCENT_COLOR = "#2f6db2"
+LOG_BG_COLOR = "#ffffff"
+LOG_FG_COLOR = "#1a1a1a"
+BORDER_COLOR = "#9b9b9b"
+BUTTON_TEXT_COLOR = "#1a1a1a"
 
 
 class YtDlpGUI:
     """Main GUI application class"""
     
+
+    def make_button(self, text, bg, active_bg, command):
+        """Create a consistently styled action button."""
+        button = tk.Button(
+            self.root,
+            text=text,
+            bg=bg,
+            fg=BUTTON_TEXT_COLOR,
+            activebackground=active_bg,
+            activeforeground=BUTTON_TEXT_COLOR,
+            relief="raised",
+            bd=2,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground=APP_BG_COLOR,
+            font=("Helvetica", 10, "normal"),
+            command=command
+        )
+        button.bind("<Enter>", lambda _e, b=button, c=active_bg: b.config(bg=c))
+        button.bind("<Leave>", lambda _e, b=button, c=bg: b.config(bg=c))
+        return button
+
+    def make_label(self, text, x, y, width=None, height=None, bold=False, font_size=10):
+        """Create a modern-styled label."""
+        label = tk.Label(
+            self.root,
+            text=text,
+            bg=APP_BG_COLOR,
+            fg=TEXT_COLOR,
+            font=("Helvetica", font_size, "bold" if bold else "normal"),
+            anchor="w"
+        )
+        if width is None and height is None:
+            label.place(x=x, y=y)
+        else:
+            place_kwargs = {"x": x, "y": y}
+            if width is not None:
+                place_kwargs["width"] = width
+            if height is not None:
+                place_kwargs["height"] = height
+            label.place(**place_kwargs)
+        return label
+
+    def configure_styles(self):
+        """Configure ttk widgets with a cleaner look."""
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(
+            "Modern.TCombobox",
+            fieldbackground=CARD_BG_COLOR,
+            background=CARD_BG_COLOR,
+            foreground=TEXT_COLOR,
+            bordercolor=BORDER_COLOR,
+            arrowsize=14
+        )
+
     def __init__(self, root):
         self.root = root
         self.root.title("yt-dlp GUI Manager (Cross-Platform)")
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.root.resizable(False, False)
+        self.root.configure(bg=APP_BG_COLOR)
+        self.configure_styles()
         
         # Get script directory
         if getattr(sys, 'frozen', False):
