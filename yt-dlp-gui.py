@@ -46,6 +46,7 @@ import tarfile
 import threading
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 # ===== CONFIGURATION =====
 PROJECT_FOLDER_NAME = "mi_yt_dlp"
@@ -101,6 +102,62 @@ class YtDlpGUI:
         
         self.add_log("")
     
+
+    def validate_url(self, url):
+        """Validate that URL is a YouTube video URL."""
+        if not url:
+            self.add_log("ERROR: Please enter a URL")
+            messagebox.showerror("Error", "Please enter a URL")
+            return False
+
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            self.add_log("ERROR: Invalid URL format")
+            messagebox.showerror("Error", "Invalid URL format")
+            return False
+
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            self.add_log("ERROR: URL must include http/https and a valid domain")
+            messagebox.showerror("Error", "Please enter a valid URL (http/https)")
+            return False
+
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        allowed_hosts = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+        if host not in allowed_hosts:
+            self.add_log("ERROR: URL must be from YouTube")
+            messagebox.showerror("Error", "URL must be from YouTube")
+            return False
+
+        path = parsed.path.strip("/")
+        path_parts = [p for p in path.split("/") if p]
+        query = parse_qs(parsed.query)
+        video_id = None
+
+        if host == "youtu.be":
+            if path_parts:
+                video_id = path_parts[0]
+        elif path_parts and path_parts[0] == "watch":
+            video_id = query.get("v", [""])[0]
+        elif path_parts and path_parts[0] in {"shorts", "embed", "live"} and len(path_parts) >= 2:
+            video_id = path_parts[1]
+
+        if not video_id or len(video_id.strip()) < 6:
+            self.add_log("ERROR: URL must point to a specific YouTube video")
+            messagebox.showerror(
+                "Error",
+                "Please paste a valid YouTube video URL.\n"
+                "Examples:\n"
+                "- https://www.youtube.com/watch?v=...\n"
+                "- https://youtu.be/..."
+            )
+            return False
+
+        return True
+
     def create_widgets(self):
         """Create all GUI widgets"""
         
@@ -540,14 +597,7 @@ After installation, restart this application to use FFmpeg.
         try:
             # Validate URL
             url = self.url_entry.get().strip()
-            if not url:
-                self.add_log("ERROR: Please enter a URL")
-                messagebox.showerror("Error", "Please enter a URL")
-                return
-            
-            if 'youtube.com' not in url and 'youtu.be' not in url:
-                self.add_log("ERROR: URL must be from youtube.com or youtu.be")
-                messagebox.showerror("Error", "URL must be from YouTube")
+            if not self.validate_url(url):
                 return
             
             self.add_log("=== Starting video download ===")
@@ -640,14 +690,7 @@ After installation, restart this application to use FFmpeg.
         try:
             # Validate URL
             url = self.url_entry.get().strip()
-            if not url:
-                self.add_log("ERROR: Please enter a URL")
-                messagebox.showerror("Error", "Please enter a URL")
-                return
-            
-            if 'youtube.com' not in url and 'youtu.be' not in url:
-                self.add_log("ERROR: URL must be from youtube.com or youtu.be")
-                messagebox.showerror("Error", "URL must be from YouTube")
+            if not self.validate_url(url):
                 return
             
             self.add_log("=== Starting audio download ===")
