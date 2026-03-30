@@ -42,8 +42,9 @@ import platform
 import shutil
 import urllib.request
 import zipfile
-import tarfile
 import threading
+import re
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
@@ -74,7 +75,84 @@ BUTTON_TEXT_COLOR = "#1a1a1a"
 
 class YtDlpGUI:
     """Main GUI application class"""
-    
+    PROGRESS_PATTERN = re.compile(r"\[download\]\s+(\d{1,3}(?:\.\d+)?)%")
+
+    def set_progress(self, percent):
+        """Set progress bar and percentage label (0-100)."""
+        if hasattr(self, "progress_var"):
+            clamped = max(0.0, min(100.0, float(percent)))
+            self.progress_var.set(clamped)
+            self.progress_value_label.config(text=f"{clamped:5.1f}%")
+            self.progress_bar.update()
+
+    def reset_progress(self):
+        """Reset progress widgets."""
+        if hasattr(self, "progress_var"):
+            self.progress_var.set(0)
+            self.progress_value_label.config(text="  0.0%")
+            self.progress_bar.update()
+
+    def update_download_progress_from_line(self, line):
+        """Parse yt-dlp output line and update progress when percentage appears."""
+        match = self.PROGRESS_PATTERN.search(line)
+        if match:
+            self.set_progress(float(match.group(1)))
+
+    def validate_url(self, url):
+        """Validate that URL is a YouTube video URL."""
+        if not url:
+            self.add_log("ERROR: Please enter a URL")
+            messagebox.showerror("Error", "Please enter a URL")
+            return False
+
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            self.add_log("ERROR: Invalid URL format")
+            messagebox.showerror("Error", "Invalid URL format")
+            return False
+
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            self.add_log("ERROR: URL must include http/https and a valid domain")
+            messagebox.showerror("Error", "Please enter a valid URL (http/https)")
+            return False
+
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        allowed_hosts = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+        if host not in allowed_hosts:
+            self.add_log("ERROR: URL must be from YouTube")
+            messagebox.showerror("Error", "URL must be from YouTube")
+            return False
+
+        # Validate this is a video endpoint (watch/shorts/embed/live/youtu.be ID)
+        path = parsed.path.strip("/")
+        path_parts = [p for p in path.split("/") if p]
+        query = parse_qs(parsed.query)
+        video_id = None
+
+        if host == "youtu.be":
+            if path_parts:
+                video_id = path_parts[0]
+        elif path_parts and path_parts[0] == "watch":
+            video_id = query.get("v", [""])[0]
+        elif path_parts and path_parts[0] in {"shorts", "embed", "live"} and len(path_parts) >= 2:
+            video_id = path_parts[1]
+
+        if not video_id or len(video_id.strip()) < 6:
+            self.add_log("ERROR: URL must point to a specific YouTube video")
+            messagebox.showerror(
+                "Error",
+                "Please paste a valid YouTube video URL.\n"
+                "Examples:\n"
+                "- https://www.youtube.com/watch?v=...\n"
+                "- https://youtu.be/..."
+            )
+            return False
+
+        return True
 
     def make_button(self, text, bg, active_bg, command):
         """Create a consistently styled action button."""
@@ -119,12 +197,20 @@ class YtDlpGUI:
         return label
 
     def configure_styles(self):
-        """Configure ttk widgets with a cleaner look."""
+        """Configure ttk widgets with a cleaner modern look."""
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except Exception:
             pass
+        style.configure(
+            "Modern.Horizontal.TProgressbar",
+            troughcolor="#d8d8d8",
+            background=ACCENT_COLOR,
+            bordercolor=BORDER_COLOR,
+            lightcolor=ACCENT_COLOR,
+            darkcolor=ACCENT_COLOR
+        )
         style.configure(
             "Modern.TCombobox",
             fieldbackground=CARD_BG_COLOR,
@@ -134,12 +220,215 @@ class YtDlpGUI:
             arrowsize=14
         )
 
+    def refresh_queue_display(self):
+        """Refresh current download and pending queue display."""
+        if self.current_download:
+            mode = self.current_download["mode"].upper()
+            url = self.current_download["url"]
+            self.current_label.config(text=f"Now downloading [{mode}]: {url[:85]}")
+        else:
+            self.current_label.config(text="Now downloading: (idle)")
+
+        self.queue_list.delete(0, 'end')
+        for index, item in enumerate(self.download_queue, start=1):
+            self.queue_list.insert('end', f"{index:02d}. [{item['mode'].upper()}] {item['url']}")
+        self.update_action_button_states()
+
+    def update_action_button_states(self):
+        """Enable/disable buttons based on current UI state."""
+        has_url = bool(self.url_entry.get().strip())
+        has_selection = bool(self.queue_list.curselection())
+        has_pending = len(self.download_queue) > 0
+        self.btn_start.config(state="normal" if has_url else "disabled")
+        self.btn_remove_selected.config(state="normal" if has_selection else "disabled")
+        self.btn_clear_queue.config(state="normal" if has_pending else "disabled")
+
+    def on_url_change(self, _event=None):
+        """Refresh button states when URL field changes."""
+        self.update_action_button_states()
+
+    def remove_selected_queue_item(self):
+        """Remove selected item from pending queue."""
+        selection = self.queue_list.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        with self.queue_lock:
+            if 0 <= index < len(self.download_queue):
+                removed = self.download_queue[index]
+                del self.download_queue[index]
+            else:
+                return
+        self.add_log(f"[-] Removed from queue [{removed['mode'].upper()}]: {removed['url']}")
+        self.refresh_queue_display()
+
+    def clear_queue_items(self):
+        """Clear all pending queue items (keeps active download)."""
+        with self.queue_lock:
+            count = len(self.download_queue)
+            self.download_queue.clear()
+        if count:
+            self.add_log(f"[-] Cleared queue: {count} pending item(s) removed")
+        self.refresh_queue_display()
+
+    def open_downloads_folder(self):
+        """Open the downloads folder, creating it if needed."""
+        if not self.downloads_path.exists():
+            self.downloads_path.mkdir(parents=True, exist_ok=True)
+            self.add_log(f"[+] Created downloads folder: {self.downloads_path}")
+        self.open_folder(self.downloads_path)
+
+    def enqueue_current_url(self):
+        """Add current URL to queue and start worker if idle."""
+        url = self.url_entry.get().strip()
+        if not self.validate_url(url):
+            return
+
+        mode = self.download_type_var.get().strip().lower() or "video"
+        item = {"url": url, "mode": mode}
+
+        with self.queue_lock:
+            self.download_queue.append(item)
+            pending_count = len(self.download_queue)
+            worker_busy = self.worker_running
+
+        self.add_log(f"[+] Added to queue [{mode.upper()}]: {url}")
+        self.add_log(f"    Pending items: {pending_count}")
+        self.url_entry.delete(0, 'end')
+        self.refresh_queue_display()
+
+        if not worker_busy:
+            thread = threading.Thread(target=self.process_queue, daemon=True)
+            thread.start()
+
+    def get_ytdlp_paths(self):
+        """Return yt-dlp and Python executables from venv."""
+        venv_path = self.project_path / "venv"
+        if CURRENT_OS == "Windows":
+            ytdlp_exe = venv_path / "Scripts" / "yt-dlp.exe"
+            python_exe = venv_path / "Scripts" / "python.exe"
+        else:
+            ytdlp_exe = venv_path / "bin" / "yt-dlp"
+            python_exe = venv_path / "bin" / "python"
+
+        if not python_exe.exists():
+            self.add_log("ERROR: Python virtual environment not found")
+            self.add_log("       Please run the 'Update' button first")
+            messagebox.showerror("Error", "Please install yt-dlp first (Update button)")
+            return None
+
+        if not ytdlp_exe.exists():
+            self.add_log("ERROR: yt-dlp not found in virtual environment")
+            self.add_log("       Please run the 'Update' button first")
+            messagebox.showerror("Error", "Please install yt-dlp first (Update button)")
+            return None
+
+        return ytdlp_exe
+
+    def process_queue(self):
+        """Process queue one by one."""
+        with self.queue_lock:
+            if self.worker_running:
+                return
+            self.worker_running = True
+
+        try:
+            while True:
+                with self.queue_lock:
+                    if not self.download_queue:
+                        self.current_download = None
+                        self.refresh_queue_display()
+                        break
+                    item = self.download_queue.popleft()
+                    self.current_download = item
+                    self.refresh_queue_display()
+                self.download_item(item)
+        finally:
+            with self.queue_lock:
+                self.worker_running = False
+                self.current_download = None
+            self.refresh_queue_display()
+            self.reset_progress()
+
+    def download_item(self, item):
+        """Download one queued item."""
+        mode = item["mode"]
+        url = item["url"]
+        self.reset_progress()
+        self.add_log(f"=== Starting {mode} download ===")
+        self.add_log(f"URL: {url}")
+
+        try:
+            if not self.downloads_path.exists():
+                self.add_log(f"[+] Creating {DOWNLOADS_FOLDER_NAME} folder...")
+                self.downloads_path.mkdir(parents=True)
+            else:
+                self.add_log(f"[+] {DOWNLOADS_FOLDER_NAME} folder found")
+
+            ytdlp_exe = self.get_ytdlp_paths()
+            if not ytdlp_exe:
+                return
+
+            self.add_log(f"[+] Downloading {mode}...")
+            self.add_log("    This may take several minutes...")
+            ssl_env = self.get_ssl_env()
+
+            if mode == "audio":
+                command = [str(ytdlp_exe), "-x", "--audio-format", "mp3", url]
+                ext_glob = "*.mp3"
+                media_tag = "MP3"
+            else:
+                command = [
+                    str(ytdlp_exe),
+                    "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "--merge-output-format", "mp4",
+                    url
+                ]
+                ext_glob = "*.mp4"
+                media_tag = "MP4"
+
+            success = self.run_command(
+                command,
+                cwd=self.project_path,
+                env=ssl_env,
+                line_callback=self.update_download_progress_from_line
+            )
+            if not success:
+                self.add_log(f"ERROR: {mode.capitalize()} download failed")
+                return
+
+            self.add_log(f"[+] Moving {media_tag} files to downloads folder...")
+            files = list(self.project_path.glob(ext_glob))
+            if not files:
+                self.add_log(f"WARNING: No {media_tag} files downloaded")
+            else:
+                moved_count = 0
+                for media_file in files:
+                    try:
+                        dest_path = self.downloads_path / media_file.name
+                        shutil.move(str(media_file), str(dest_path))
+                        self.add_log(f"    [OK] {media_file.name} moved successfully")
+                        moved_count += 1
+                    except Exception as e:
+                        self.add_log(f"    [ERROR] Could not move {media_file.name}: {str(e)}")
+                self.add_log(f"[+] Moved {moved_count} of {len(files)} {media_tag} file(s)")
+
+            self.open_folder(self.downloads_path)
+            self.set_progress(100)
+            self.add_log(f"=== {mode.upper()} DOWNLOAD COMPLETED ===")
+        except Exception as e:
+            self.add_log(f"CRITICAL ERROR ({mode}): {str(e)}")
+
     def __init__(self, root):
         self.root = root
         self.root.title("yt-dlp GUI Manager (Cross-Platform)")
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.root.resizable(False, False)
         self.root.configure(bg=APP_BG_COLOR)
+        self.download_queue = deque()
+        self.current_download = None
+        self.queue_lock = threading.Lock()
+        self.worker_running = False
         self.configure_styles()
         
         # Get script directory
@@ -160,6 +449,7 @@ class YtDlpGUI:
         self.add_log("=== yt-dlp GUI Manager started ===")
         self.add_log(f"Detected OS: {CURRENT_OS}")
         self.add_log("Press [Update] to install/update yt-dlp")
+        self.add_log("Use [Start] to add URL to the queue")
         
         # macOS specific SSL certificate notice
         if CURRENT_OS == "Darwin":
@@ -169,84 +459,45 @@ class YtDlpGUI:
         
         self.add_log("")
     
-
-    def validate_url(self, url):
-        """Validate that URL is a YouTube video URL."""
-        if not url:
-            self.add_log("ERROR: Please enter a URL")
-            messagebox.showerror("Error", "Please enter a URL")
-            return False
-
-        try:
-            parsed = urlparse(url)
-        except Exception:
-            self.add_log("ERROR: Invalid URL format")
-            messagebox.showerror("Error", "Invalid URL format")
-            return False
-
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            self.add_log("ERROR: URL must include http/https and a valid domain")
-            messagebox.showerror("Error", "Please enter a valid URL (http/https)")
-            return False
-
-        host = parsed.netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-
-        allowed_hosts = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
-        if host not in allowed_hosts:
-            self.add_log("ERROR: URL must be from YouTube")
-            messagebox.showerror("Error", "URL must be from YouTube")
-            return False
-
-        path = parsed.path.strip("/")
-        path_parts = [p for p in path.split("/") if p]
-        query = parse_qs(parsed.query)
-        video_id = None
-
-        if host == "youtu.be":
-            if path_parts:
-                video_id = path_parts[0]
-        elif path_parts and path_parts[0] == "watch":
-            video_id = query.get("v", [""])[0]
-        elif path_parts and path_parts[0] in {"shorts", "embed", "live"} and len(path_parts) >= 2:
-            video_id = path_parts[1]
-
-        if not video_id or len(video_id.strip()) < 6:
-            self.add_log("ERROR: URL must point to a specific YouTube video")
-            messagebox.showerror(
-                "Error",
-                "Please paste a valid YouTube video URL.\n"
-                "Examples:\n"
-                "- https://www.youtube.com/watch?v=...\n"
-                "- https://youtu.be/..."
-            )
-            return False
-
-        return True
-
     def create_widgets(self):
         """Create all GUI widgets"""
         
         # URL input section
-        url_label = tk.Label(self.root, text="Video URL:", font=("Arial", 10))
-        url_label.place(x=10, y=15)
+        self.make_label("YouTube URL:", 10, 15, bold=True)
         
-        self.url_entry = tk.Entry(self.root, font=("Consolas", 10), width=75)
+        self.url_entry = tk.Entry(
+            self.root,
+            font=("Helvetica", 10, "normal"),
+            width=75,
+            bg=CARD_BG_COLOR,
+            fg=TEXT_COLOR,
+            insertbackground=TEXT_COLOR,
+            relief="solid",
+            bd=1,
+            disabledbackground="#dddddd",
+            disabledforeground="#777777",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR
+        )
         self.url_entry.place(x=10, y=40, width=660, height=25)
+        self.url_entry.bind("<KeyRelease>", self.on_url_change)
         
         # Buttons - Row 1 (Setup buttons)
-        self.btn_update = tk.Button(
-            self.root, text="Update", bg="#90EE90", 
-            font=("Arial", 10, "bold"), command=self.install_ytdlp_thread
+        self.btn_update = self.make_button(
+            text="Update yt-dlp",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.install_ytdlp_thread
         )
-        self.btn_update.place(x=10, y=75, width=100, height=35)
+        self.btn_update.place(x=10, y=75, width=150, height=35)
         
-        self.btn_ffmpeg = tk.Button(
-            self.root, text="FFmpeg", bg="#FFA07A",
-            font=("Arial", 10, "bold"), command=self.install_ffmpeg_thread
+        self.btn_ffmpeg = self.make_button(
+            text="Setup FFmpeg",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.install_ffmpeg_thread
         )
-        self.btn_ffmpeg.place(x=120, y=75, width=100, height=35)
+        self.btn_ffmpeg.place(x=170, y=75, width=130, height=35)
         
         # Download options
         self.make_label("Type:", 315, 82, bold=True)
@@ -260,34 +511,117 @@ class YtDlpGUI:
         )
         self.download_type_combo.place(x=355, y=80, width=105, height=28)
 
-        # Buttons - Row 2 (Action buttons)
-        self.btn_start = tk.Button(
-            self.root, text="Start", bg="#ADD8E6",
-            font=("Arial", 10, "bold"), command=self.start_download_thread
+        # Buttons - Row 2 (Queue actions)
+        self.btn_start = self.make_button(
+            text="Add to Queue",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.enqueue_current_url
         )
-        self.btn_start.place(x=10, y=120, width=160, height=35)
+        self.btn_start.place(x=10, y=120, width=120, height=35)
+        
+        self.btn_remove_selected = self.make_button(
+            text="Remove Selected",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.remove_selected_queue_item
+        )
+        self.btn_remove_selected.place(x=140, y=120, width=120, height=35)
+        
+        self.btn_clear_queue = self.make_button(
+            text="Clear Queue",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.clear_queue_items
+        )
+        self.btn_clear_queue.place(x=270, y=120, width=120, height=35)
 
-        self.btn_clear_log = tk.Button(
-            self.root, text="Clear Log", bg="#FFFFE0",
-            font=("Arial", 10, "bold"), command=self.clear_log
+        self.btn_clear_log = self.make_button(
+            text="Clear Log",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.clear_log
         )
-        self.btn_clear_log.place(x=180, y=120, width=160, height=35)
+        self.btn_clear_log.place(x=400, y=120, width=85, height=35)
 
-        self.btn_exit = tk.Button(
-            self.root, text="Exit", bg="#D3D3D3",
-            font=("Arial", 10, "bold"), command=self.root.quit
+        self.btn_open_downloads = self.make_button(
+            text="Open Downloads",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.open_downloads_folder
         )
-        self.btn_exit.place(x=350, y=120, width=320, height=35)
+        self.btn_open_downloads.place(x=490, y=120, width=105, height=35)
+        
+        self.btn_exit = self.make_button(
+            text="Exit",
+            bg="#e6e6e6",
+            active_bg="#d9d9d9",
+            command=self.root.quit
+        )
+        self.btn_exit.place(x=600, y=120, width=70, height=35)
+        
+        # Queue section
+        self.make_label("Queue:", 10, 165, bold=True)
+        self.current_label = tk.Label(
+            self.root,
+            text="Now downloading: (idle)",
+            font=("Helvetica", 9, "normal"),
+            anchor="w",
+            bg=APP_BG_COLOR,
+            fg=MUTED_TEXT_COLOR
+        )
+        self.current_label.place(x=10, y=188, width=660, height=22)
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(
+            self.root,
+            variable=self.progress_var,
+            maximum=100,
+            mode="determinate",
+            style="Modern.Horizontal.TProgressbar"
+        )
+        self.progress_bar.place(x=10, y=212, width=610, height=20)
+        self.progress_value_label = tk.Label(
+            self.root,
+            text="  0.0%",
+            font=("Helvetica", 9, "bold"),
+            anchor="e",
+            bg=APP_BG_COLOR,
+            fg=ACCENT_COLOR
+        )
+        self.progress_value_label.place(x=625, y=212, width=45, height=20)
+        self.queue_list = tk.Listbox(
+            self.root,
+            font=("Helvetica", 9),
+            bg=CARD_BG_COLOR,
+            fg=TEXT_COLOR,
+            relief="solid",
+            bd=1,
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+            selectbackground="#316ac5",
+            selectforeground="#ffffff"
+        )
+        self.queue_list.place(x=10, y=238, width=660, height=46)
+        self.queue_list.bind("<<ListboxSelect>>", lambda _e: self.update_action_button_states())
         
         # Log section
-        log_label = tk.Label(self.root, text="Log:", font=("Arial", 10))
-        log_label.place(x=10, y=165)
+        self.make_label("Log:", 10, 290, bold=True)
         
         self.log_text = scrolledtext.ScrolledText(
-            self.root, font=("Consolas", 9), bg=LOG_BG_COLOR,
-            fg=LOG_FG_COLOR, state='disabled', wrap='word'
+            self.root,
+            font=("Helvetica", 9),
+            bg=LOG_BG_COLOR,
+            fg=LOG_FG_COLOR,
+            insertbackground=TEXT_COLOR,
+            state='disabled',
+            wrap='word',
+            relief="solid",
+            bd=1,
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR
         )
-        self.log_text.place(x=10, y=190, width=660, height=305)
+        self.log_text.place(x=10, y=315, width=660, height=180)
+        self.update_action_button_states()
     
     def add_log(self, message):
         """Add timestamped message to log"""
@@ -307,7 +641,7 @@ class YtDlpGUI:
         self.log_text.config(state='disabled')
         self.add_log("Log cleared")
     
-    def run_command(self, command, cwd=None, shell=False, env=None):
+    def run_command(self, command, cwd=None, shell=False, env=None, line_callback=None):
         """Run a command and return output line by line"""
         try:
             # Use system environment and add custom env if provided
@@ -327,10 +661,13 @@ class YtDlpGUI:
                 env=cmd_env
             )
             
-            for line in process.stdout:
-                line = line.strip()
-                if line:
-                    self.add_log(line)
+            if process.stdout is not None:
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        self.add_log(line)
+                        if line_callback:
+                            line_callback(line)
             
             process.wait()
             return process.returncode == 0
@@ -657,200 +994,6 @@ After installation, restart this application to use FFmpeg.
         )
     
     # ===== DOWNLOAD FUNCTIONS =====
-    
-
-    def start_download_thread(self):
-        """Start download based on selected type."""
-        mode = self.download_type_var.get().strip().lower()
-        if mode == "video":
-            self.download_video_thread()
-        else:
-            self.download_audio_thread()
-
-    def download_video_thread(self):
-        """Thread wrapper for download_video"""
-        thread = threading.Thread(target=self.download_video, daemon=True)
-        thread.start()
-    
-    def download_video(self):
-        """Download video in MP4 format"""
-        self.btn_download_video.config(state='disabled')
-        
-        try:
-            # Validate URL
-            url = self.url_entry.get().strip()
-            if not self.validate_url(url):
-                return
-            
-            self.add_log("=== Starting video download ===")
-            self.add_log(f"URL: {url}")
-            
-            # Create downloads folder
-            if not self.downloads_path.exists():
-                self.add_log(f"[+] Creating {DOWNLOADS_FOLDER_NAME} folder...")
-                self.downloads_path.mkdir(parents=True)
-            else:
-                self.add_log(f"[+] {DOWNLOADS_FOLDER_NAME} folder found")
-            
-            # Get yt-dlp executable
-            venv_path = self.project_path / "venv"
-            if CURRENT_OS == "Windows":
-                ytdlp_exe = venv_path / "Scripts" / "yt-dlp.exe"
-                python_exe = venv_path / "Scripts" / "python.exe"
-            else:
-                ytdlp_exe = venv_path / "bin" / "yt-dlp"
-                python_exe = venv_path / "bin" / "python"
-            
-            if not python_exe.exists():
-                self.add_log("ERROR: Python virtual environment not found")
-                self.add_log("       Please run the 'Update' button first")
-                messagebox.showerror("Error", "Please install yt-dlp first (Update button)")
-                return
-            
-            if not ytdlp_exe.exists():
-                self.add_log("ERROR: yt-dlp not found in virtual environment")
-                self.add_log("       Please run the 'Update' button first")
-                messagebox.showerror("Error", "Please install yt-dlp first (Update button)")
-                return
-            
-            self.add_log("[+] Downloading video in MP4 format...")
-            self.add_log("    This may take several minutes...")
-            
-            # Get SSL environment for macOS
-            ssl_env = self.get_ssl_env()
-            
-            # Run yt-dlp
-            self.run_command(
-                [str(ytdlp_exe), "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                 "--merge-output-format", "mp4", url],
-                cwd=self.project_path,
-                env=ssl_env
-            )
-            
-            # Move MP4 files to downloads folder
-            self.add_log("[+] Moving MP4 files to downloads folder...")
-            mp4_files = list(self.project_path.glob("*.mp4"))
-            
-            if not mp4_files:
-                self.add_log("WARNING: No MP4 files downloaded")
-            else:
-                moved_count = 0
-                for mp4_file in mp4_files:
-                    try:
-                        dest_path = self.downloads_path / mp4_file.name
-                        shutil.move(str(mp4_file), str(dest_path))
-                        self.add_log(f"    [OK] {mp4_file.name} moved successfully")
-                        moved_count += 1
-                    except Exception as e:
-                        self.add_log(f"    [ERROR] Could not move {mp4_file.name}: {str(e)}")
-                
-                self.add_log(f"[+] Moved {moved_count} of {len(mp4_files)} MP4 file(s)")
-            
-            # Open downloads folder
-            self.add_log("[+] Opening downloads folder...")
-            self.open_folder(self.downloads_path)
-            
-            self.add_log("=== VIDEO DOWNLOAD COMPLETED ===")
-            messagebox.showinfo("Success", "Video download completed!")
-        
-        except Exception as e:
-            self.add_log(f"CRITICAL ERROR: {str(e)}")
-            messagebox.showerror("Error", f"An error occurred: {str(e)}")
-        
-        finally:
-            self.btn_download_video.config(state='normal')
-    
-    def download_audio_thread(self):
-        """Thread wrapper for download_audio"""
-        thread = threading.Thread(target=self.download_audio, daemon=True)
-        thread.start()
-    
-    def download_audio(self):
-        """Download audio in MP3 format"""
-        self.btn_download_audio.config(state='disabled')
-        
-        try:
-            # Validate URL
-            url = self.url_entry.get().strip()
-            if not self.validate_url(url):
-                return
-            
-            self.add_log("=== Starting audio download ===")
-            self.add_log(f"URL: {url}")
-            
-            # Create downloads folder
-            if not self.downloads_path.exists():
-                self.add_log(f"[+] Creating {DOWNLOADS_FOLDER_NAME} folder...")
-                self.downloads_path.mkdir(parents=True)
-            else:
-                self.add_log(f"[+] {DOWNLOADS_FOLDER_NAME} folder found")
-            
-            # Get yt-dlp executable
-            venv_path = self.project_path / "venv"
-            if CURRENT_OS == "Windows":
-                ytdlp_exe = venv_path / "Scripts" / "yt-dlp.exe"
-                python_exe = venv_path / "Scripts" / "python.exe"
-            else:
-                ytdlp_exe = venv_path / "bin" / "yt-dlp"
-                python_exe = venv_path / "bin" / "python"
-            
-            if not python_exe.exists():
-                self.add_log("ERROR: Python virtual environment not found")
-                self.add_log("       Please run the 'Update' button first")
-                messagebox.showerror("Error", "Please install yt-dlp first (Update button)")
-                return
-            
-            if not ytdlp_exe.exists():
-                self.add_log("ERROR: yt-dlp not found in virtual environment")
-                self.add_log("       Please run the 'Update' button first")
-                messagebox.showerror("Error", "Please install yt-dlp first (Update button)")
-                return
-            
-            self.add_log("[+] Downloading audio in MP3 format...")
-            self.add_log("    This may take several minutes...")
-            
-            # Get SSL environment for macOS
-            ssl_env = self.get_ssl_env()
-            
-            # Run yt-dlp
-            self.run_command(
-                [str(ytdlp_exe), "-x", "--audio-format", "mp3", url],
-                cwd=self.project_path,
-                env=ssl_env
-            )
-            
-            # Move MP3 files to downloads folder
-            self.add_log("[+] Moving MP3 files to downloads folder...")
-            mp3_files = list(self.project_path.glob("*.mp3"))
-            
-            if not mp3_files:
-                self.add_log("WARNING: No MP3 files downloaded")
-            else:
-                moved_count = 0
-                for mp3_file in mp3_files:
-                    try:
-                        dest_path = self.downloads_path / mp3_file.name
-                        shutil.move(str(mp3_file), str(dest_path))
-                        self.add_log(f"    [OK] {mp3_file.name} moved successfully")
-                        moved_count += 1
-                    except Exception as e:
-                        self.add_log(f"    [ERROR] Could not move {mp3_file.name}: {str(e)}")
-                
-                self.add_log(f"[+] Moved {moved_count} of {len(mp3_files)} MP3 file(s)")
-            
-            # Open downloads folder
-            self.add_log("[+] Opening downloads folder...")
-            self.open_folder(self.downloads_path)
-            
-            self.add_log("=== AUDIO DOWNLOAD COMPLETED ===")
-            messagebox.showinfo("Success", "Audio download completed!")
-        
-        except Exception as e:
-            self.add_log(f"CRITICAL ERROR: {str(e)}")
-            messagebox.showerror("Error", f"An error occurred: {str(e)}")
-        
-        finally:
-            self.btn_download_audio.config(state='normal')
     
     def open_folder(self, folder_path):
         """Open folder in system file explorer"""
